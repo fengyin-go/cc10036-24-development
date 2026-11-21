@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.cohort_progress import cohort_progress_store
 from app.store import store
 
 
@@ -94,11 +95,92 @@ class QuerySchedulerService(BaseModuleService):
                     retried += 1
         return {"ok": True, "retried_count": retried}
 
+    # ---- 跨模块：读取同期群持久窗口进度 ----
+
+    def get_cohort_recovery_plan(self, config_id: int | None = None) -> dict[str, Any]:
+        """读取同期群进度数据，判断失败恢复需要处理的窗口。"""
+        cohort_svc = _cohort_service()
+        if cohort_svc is None:
+            return {"ok": False, "message": "同期群服务不可用"}
+        plan = cohort_svc.build_recovery_plan(config_id)
+        plan["source_module"] = "cohort_analysis"
+        plan["scheduler"] = "query_scheduler"
+        return plan
+
+    def retry_cohort_recovery(
+        self,
+        config_id: int | None = None,
+        events: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """按同期群进度恢复失败窗口：同一批次续跑，从未交付窗口继续。"""
+        cohort_svc = _cohort_service()
+        if cohort_svc is None:
+            return {"ok": False, "message": "同期群服务不可用"}
+
+        plan = cohort_svc.build_recovery_plan(config_id)
+        if not plan.get("plans"):
+            return {
+                "ok": True,
+                "message": "没有需要恢复的同期群窗口",
+                "retried": 0,
+                "plans": [],
+            }
+
+        retried: list[dict[str, Any]] = []
+        failures: list[dict[str, Any]] = []
+        for item in plan["plans"]:
+            cid = int(item["config_id"])
+            batch_events = (
+                events if events is not None else cohort_progress_store.recall_events(item["run_id"])
+            )
+            if batch_events is None:
+                failures.append({
+                    "config_id": cid,
+                    "run_id": item["run_id"],
+                    "data_version": item["data_version"],
+                    "watermark": item["watermark"],
+                    "message": "缺少该批次事件数据，无法恢复；请按 data_version 重新载入同一批事件",
+                })
+                continue
+            result = cohort_svc.run_cohort_analysis(
+                cid,
+                batch_events,
+                resume=True,
+                watermark=float(item["watermark"]),
+            )
+            retried.append({
+                "config_id": cid,
+                "run_id": item["run_id"],
+                "ok": bool(result.get("ok")),
+                "run_status": result.get("run_status"),
+                "windows_written": result.get("windows_written"),
+                "progress": result.get("progress"),
+            })
+
+        return {
+            "ok": not failures,
+            "message": (
+                "同期群窗口恢复完成"
+                if not failures else "部分同期群批次缺少事件数据，未能恢复"
+            ),
+            "retried": len(retried),
+            "results": retried,
+            "failures": failures,
+        }
+
     def domain_snapshot(self) -> dict[str, Any]:
         base = super().domain_snapshot()
         base["artifact"] = "查询调度数据集"
         base["ready_count"] = len(self.get_ready_plans())
+        cohort_plan = self.get_cohort_recovery_plan()
+        base["cohort_recovery_plans"] = cohort_plan.get("plan_count", 0)
+        base["cohort_pending_windows"] = cohort_plan.get("pending_window_total", 0)
         return base
+
+
+def _cohort_service() -> Any:
+    from app.services import service_for
+    return service_for("cohort_analysis")
 
 
 def _is_completed(row: dict[str, Any]) -> bool:

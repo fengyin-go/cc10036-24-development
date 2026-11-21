@@ -200,6 +200,21 @@ def segment_population(
 # ---------------------------------------------------------------------------
 
 @dataclass
+class CohortRetentionDetail:
+    """同期群保留率的完整明细：分子、分母和百分比口径一次算出。
+
+    cohort_denominators[i] 是第 i 个同期群的成员数，也是该群每个周期窗口的
+    分母；numerators[i][p] 是第 i 个群在第 p 个周期内的回访人数。两者来自
+    同一批 events，任何窗口都不能混用另一批数据。
+    """
+    cohort_ids: list[str]
+    period_labels: list[str]
+    cohort_denominators: list[int]
+    numerators: list[list[int]]
+    retention_matrix: list[list[float]]  # [cohort_index][period_index] = 保留率
+
+
+@dataclass
 class CohortMatrix:
     """同期群矩阵：行=同期群（按初始事件时间划分），列=周期偏移。"""
     cohort_ids: list[str]
@@ -207,17 +222,17 @@ class CohortMatrix:
     retention_matrix: list[list[float]]  # [cohort_index][period_index] = 保留率
 
 
-def compute_cohort_retention(
+def compute_cohort_retention_detail(
     events: list[dict[str, Any]],
     init_event_name: str,
     return_event_name: str,
     period_days: int = 7,
     max_periods: int = 8,
-) -> CohortMatrix:
-    """计算同期群保留率矩阵。
+) -> CohortRetentionDetail:
+    """计算同期群保留率的分子、分母与百分比矩阵。
 
     events: 每行 {user_id, event_name, event_time(epoch_seconds)}
-    返回保留率矩阵（百分比 0-100）。
+    所有窗口共用这一批 events，因此返回的分子分母天然同源。
     """
     # 按user分组事件
     user_events: dict[str, list[tuple[str, float]]] = defaultdict(list)
@@ -251,16 +266,25 @@ def compute_cohort_retention(
         cohort_buckets[week].add(uid)
 
     sorted_weeks = sorted(cohort_buckets)
-    cohort_ids = [_week_label(w, period_days) for w in sorted_weeks]
+    # 周期不是 7 天时，多个 bucket 可能落在同一个自然周标签里；标签必须唯一，
+    # 否则持久化的「群组 × 窗口」键会互相覆盖。给重复标签补上 bucket 序号。
+    cohort_ids = _unique_cohort_labels(
+        [_week_label(w * period_seconds) for w in sorted_weeks], sorted_weeks,
+    )
+    cohort_denominators: list[int] = []
+    numerators: list[list[int]] = []
     matrix: list[list[float]] = []
 
-    for wi, week in enumerate(sorted_weeks):
+    for week in sorted_weeks:
         users_in_cohort = cohort_buckets[week]
         total = len(users_in_cohort)
+        cohort_denominators.append(total)
         if total == 0:
+            numerators.append([0] * max_periods)
             matrix.append([0.0] * max_periods)
             continue
         cohort_start = week * period_seconds
+        period_counts: list[int] = []
         period_rates: list[float] = []
         for p in range(max_periods):
             period_end = cohort_start + (p + 1) * period_seconds
@@ -269,22 +293,57 @@ def compute_cohort_retention(
                 return_times = user_return_times.get(uid, [])
                 if any(cohort_start < rt <= period_end for rt in return_times):
                     retained += 1
-            rate = round(retained / total * 100, 2)
-            period_rates.append(rate)
+            period_counts.append(retained)
+            period_rates.append(round(retained / total * 100, 2))
+        numerators.append(period_counts)
         matrix.append(period_rates)
 
     period_labels = [f"周{i + 1}" for i in range(max_periods)]
-    return CohortMatrix(
+    return CohortRetentionDetail(
         cohort_ids=cohort_ids,
         period_labels=period_labels,
+        cohort_denominators=cohort_denominators,
+        numerators=numerators,
         retention_matrix=matrix,
     )
 
 
-def _week_label(epoch_seconds: float, period_days: int) -> str:
+def compute_cohort_retention(
+    events: list[dict[str, Any]],
+    init_event_name: str,
+    return_event_name: str,
+    period_days: int = 7,
+    max_periods: int = 8,
+) -> CohortMatrix:
+    """计算同期群保留率矩阵。
+
+    events: 每行 {user_id, event_name, event_time(epoch_seconds)}
+    返回保留率矩阵（百分比 0-100）。
+    """
+    detail = compute_cohort_retention_detail(
+        events, init_event_name, return_event_name, period_days, max_periods,
+    )
+    return CohortMatrix(
+        cohort_ids=detail.cohort_ids,
+        period_labels=detail.period_labels,
+        retention_matrix=detail.retention_matrix,
+    )
+
+
+def _week_label(epoch_seconds: float, period_days: int = 7) -> str:
     import datetime
     dt = datetime.datetime.fromtimestamp(epoch_seconds, tz=datetime.timezone.utc)
     return dt.strftime("W%W-%Y")
+
+
+def _unique_cohort_labels(labels: list[str], buckets: list[int]) -> list[str]:
+    """让同期群标签唯一且稳定：重复标签追加 bucket 序号。"""
+    seen: dict[str, int] = defaultdict(int)
+    unique: list[str] = []
+    for label, bucket in zip(labels, buckets):
+        seen[label] += 1
+        unique.append(label if seen[label] == 1 else f"{label}#{bucket}")
+    return unique
 
 
 # ---------------------------------------------------------------------------

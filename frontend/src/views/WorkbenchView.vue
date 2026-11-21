@@ -90,6 +90,11 @@
       <span>共 {{ total }} 条{{ meta.name }}记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
+
+    <CohortProgressPanel
+      v-if="meta.key === 'cohort_analysis'"
+      :config-id="cohortConfigId"
+    />
   </section>
 </template>
 
@@ -103,10 +108,12 @@ import {
   moduleMeta,
   runAction as applyAction,
 } from '@/api/backend-service'
+import CohortProgressPanel from '@/components/CohortProgressPanel.vue'
 import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
+const cohortConfigId = computed(() => Number(rows.value[0]?.id ?? 1))
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')

@@ -69,6 +69,35 @@ npm run dev
 | 数据范围 | `olap_scope` | 范围规则 | 规则名称、数据范围、授权对象 |
 | 实验分析 | `ab_analysis` | 实验配置 | 实验名称、对照组、实验组 |
 
+## 同期群持久窗口进度
+
+同期群分析按「群组 × 周期窗口」逐格推进，每一格在同一个 SQLite 事务里同时写入
+进度表和不可变交付台账（`backend/app/cohort_progress.py`，默认
+`backend/.data/cohort_progress.sqlite3`，可用 `COHORT_PROGRESS_DB` 覆盖）。
+
+- **中断可核对**：`GET /api/cohort/{config_id}/progress` 返回已交付 / 待处理窗口、
+  尝试记录和数据批次指纹；进程被杀后，调度读取时会把遗留的 `running` 尝试
+  识别为 `interrupted`（按 PID 活性判定）。
+- **不消费半个窗口**：一个窗口只会以「完整」或「不存在」出现；分子大于分母、
+  保留率与分子分母不一致、分母与批次快照不一致的写入都会被拒绝。
+- **同批续跑**：`POST /api/cohort/runs`（可带 `stop_after_windows` 复现中断）
+  在事件批次指纹未变时只补未交付窗口；批次事件持久化在台账里，进程重启后
+  无需重新提供事件即可恢复。
+- **换批重算**：迟到一笔更早的注册事件会改变 `data_version`，旧运行整体标记为
+  `superseded`（交付证据保留可查），新运行按新批次重算全部窗口，分子分母
+  始终取自同一批数据。
+- **已交付依据**：`GET /api/cohort/{config_id}/retention` 返回已发布的留存矩阵，
+  未交付窗口显式为 `null`。
+- **查询调度消费**：`GET /api/cohort/recovery-plan` 判断失败恢复需要处理的窗口，
+  `POST /api/cohort/recovery-plan/retry` 按同一批次续跑。
+- 前端 `同期群分析` 页在列表下方展示进度与已交付矩阵。
+
+回归测试：
+
+```bash
+cd backend && .venv/bin/python -m unittest discover -s tests -v
+```
+
 ## 约定
 
 - 全部模块共享`frontend/src/views/WorkbenchView.vue|tsx`和一套资源路由。

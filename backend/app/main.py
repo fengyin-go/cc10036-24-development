@@ -288,6 +288,71 @@ def scheduler_topology() -> dict[str, Any]:
     return svc.topological_order()
 
 
+# ---- 同期群持久窗口进度：执行 / 核对 / 已交付依据 / 调度恢复 ----
+@app.post("/api/cohort/runs")
+def run_cohort(
+    config_id: int = 1,
+    events: list[dict[str, Any]] | None = None,
+    stop_after_windows: int | None = None,
+    watermark: float | None = None,
+    resume: bool = True,
+) -> dict[str, Any]:
+    """执行或续跑同期群分析，按窗口持久化进度。
+
+    ``stop_after_windows`` 用于复现「按周计算到一半」的中断；每个窗口仍是
+    原子写入的完整窗口。
+    """
+    svc = service_for("cohort_analysis")
+    if svc is None:
+        return {"ok": False, "message": "同期群服务未就绪"}
+    return svc.run_cohort_analysis(
+        config_id,
+        events if events is not None else _sample_user_events(),
+        resume=resume,
+        stop_after_windows=stop_after_windows,
+        watermark=watermark,
+    )
+
+
+@app.get("/api/cohort/{config_id}/progress")
+def cohort_progress(config_id: int, run_id: str | None = None) -> dict[str, Any]:
+    """重新进入分析时核对：哪些窗口已交付、哪些待处理。"""
+    svc = service_for("cohort_analysis")
+    if svc is None:
+        return {"ok": False, "message": "同期群服务未就绪"}
+    return svc.inspect_progress(config_id, run_id)
+
+
+@app.get("/api/cohort/{config_id}/retention")
+def cohort_retention(config_id: int) -> dict[str, Any]:
+    """已交付的留存依据；未交付窗口显式为 null。"""
+    svc = service_for("cohort_analysis")
+    if svc is None:
+        return {"ok": False, "message": "同期群服务未就绪"}
+    return svc.get_delivered_retention(config_id)
+
+
+@app.get("/api/cohort/recovery-plan")
+def cohort_recovery_plan(config_id: int | None = None) -> dict[str, Any]:
+    """查询调度读取同期群进度，判断失败恢复需要处理的窗口。"""
+    svc = service_for("query_scheduler")
+    if svc is None:
+        return {"ok": False, "message": "调度服务未就绪"}
+    return svc.get_cohort_recovery_plan(config_id)
+
+
+@app.post("/api/cohort/recovery-plan/retry")
+def cohort_recovery_retry(
+    config_id: int | None = None,
+    events: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """查询调度按同期群进度恢复未交付窗口（同一批次续跑）。"""
+    svc = service_for("query_scheduler")
+    if svc is None:
+        return {"ok": False, "message": "调度服务未就绪"}
+    return svc.retry_cohort_recovery(config_id, events)
+
+
 # ---- 辅助数据生成函数 ----
 def _sample_behavior_data() -> list[dict[str, Any]]:
     return [
